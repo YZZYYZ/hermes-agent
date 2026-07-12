@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Header, HTTPException
@@ -13,9 +17,6 @@ from tools.gradeos_tools import set_gradeos_session_scope
 
 
 app = FastAPI(title="GradeOS Hermes Smoke Server")
-
-DEFAULT_DEV_TOKEN = "gradeos-local-dev-token"
-
 
 class TeacherInfo(BaseModel):
     teacher_id: str = "local_teacher"
@@ -109,17 +110,21 @@ def readyz() -> Dict[str, Any]:
         "status": "ok",
         "openrouter_key": bool(os.getenv("OPENROUTER_API_KEY")),
         "provider": os.getenv("HERMES_INFERENCE_PROVIDER") or "openrouter",
-        "auth_configured": bool(os.getenv("HERMES_INTERNAL_KEY") or os.getenv("API_SERVER_KEY")),
+        "auth_configured": bool(os.getenv("HERMES_AGENT_SERVICE_TOKEN")),
         "gradeos_internal_api": os.getenv("GRADEOS_INTERNAL_API_BASE_URL", "http://127.0.0.1:8001"),
     }
 
 
-def _expected_token() -> str:
-    return os.getenv("HERMES_INTERNAL_KEY") or os.getenv("API_SERVER_KEY") or DEFAULT_DEV_TOKEN
+def _expected_token() -> Optional[str]:
+    # Codex change: mirror GradeOS teacher Hermes auth and fail closed without a service token.
+    token = os.getenv("HERMES_AGENT_SERVICE_TOKEN")
+    return token.strip() if token and token.strip() else None
 
 
 def _verify_internal_auth(authorization: Optional[str]) -> None:
     expected = _expected_token()
+    if not expected:
+        raise HTTPException(status_code=503, detail="HERMES_AGENT_SERVICE_TOKEN is not configured")
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing Hermes internal bearer token")
     token = authorization.removeprefix("Bearer ").strip()
@@ -148,6 +153,92 @@ def _fallback_student_session_key(request: StudentAgentChatRequest) -> str:
     tenant_id = request.scope.get("tenant_id") or "local"
     user_id = request.student.student_id
     return f"gradeos:tenant:{tenant_id}:student:{user_id}:conversation:{request.session_id}"
+
+
+# Codex change: verify student-scoped GradeOS tokens before Hermes handles student chats.
+def _student_scope_signing_secret() -> Optional[str]:
+    secret = os.getenv("GRADEOS_HERMES_SCOPE_SIGNING_SECRET")
+    return secret.strip() if secret and secret.strip() else None
+
+
+def _b64url_decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(f"{value}{padding}".encode("ascii"))
+
+
+def _b64url_encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+
+def _student_scope_signature(encoded_payload: str, secret: str) -> str:
+    digest = hmac.new(
+        secret.encode("utf-8"),
+        encoded_payload.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    return _b64url_encode(digest)
+
+
+def _clean_student_scope(scope: Dict[str, Any]) -> Dict[str, Any]:
+    allowed_keys = {
+        "batch_id",
+        "class_id",
+        "homework_id",
+        "conversation_id",
+        "org_id",
+        "tenant_id",
+    }
+    cleaned: Dict[str, Any] = {}
+    for key in allowed_keys:
+        value = scope.get(key)
+        if value is None or value == "":
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            cleaned[key] = str(value) if not isinstance(value, bool) else value
+    return cleaned
+
+
+def _verify_student_scope_token(
+    token: Optional[str],
+    *,
+    student_id: str,
+    session_id: str,
+    scope: Dict[str, Any],
+) -> None:
+    secret = _student_scope_signing_secret()
+    if not secret:
+        raise HTTPException(
+            status_code=503,
+            detail="GRADEOS_HERMES_SCOPE_SIGNING_SECRET is not configured",
+        )
+    if not token or "." not in token:
+        raise HTTPException(status_code=403, detail="Missing GradeOS student scope token")
+
+    encoded_payload, signature = token.split(".", 1)
+    expected_signature = _student_scope_signature(encoded_payload, secret)
+    if not hmac.compare_digest(signature, expected_signature):
+        raise HTTPException(status_code=403, detail="Invalid GradeOS student scope token")
+
+    try:
+        payload = json.loads(_b64url_decode(encoded_payload))
+    except Exception as exc:
+        raise HTTPException(status_code=403, detail="Invalid GradeOS student scope payload") from exc
+
+    if payload.get("v") != 1 or payload.get("principal_type") != "student":
+        raise HTTPException(status_code=403, detail="Unsupported GradeOS student scope token")
+    if int(payload.get("exp") or 0) <= int(time.time()):
+        raise HTTPException(status_code=403, detail="Expired GradeOS student scope token")
+    if str(payload.get("student_id") or "").strip() != student_id:
+        raise HTTPException(status_code=403, detail="Student is outside signed GradeOS scope")
+    if str(payload.get("session_id") or "").strip() != session_id:
+        raise HTTPException(status_code=403, detail="Session is outside signed GradeOS scope")
+
+    signed_scope = _clean_student_scope(
+        payload.get("scope") if isinstance(payload.get("scope"), dict) else {}
+    )
+    request_scope = _clean_student_scope(scope)
+    if signed_scope != request_scope:
+        raise HTTPException(status_code=403, detail="Request scope is outside signed GradeOS scope")
 
 
 def _build_agent(session_id: str, session_key: str) -> AIAgent:
@@ -228,6 +319,20 @@ def _compact_attachment(attachment: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(text, str) and text:
         compact["text_preview"] = text[:2400]
     return compact
+
+
+def _prompt_safe_dict(value: Dict[str, Any]) -> Dict[str, Any]:
+    safe: Dict[str, Any] = {}
+    for key, item in value.items():
+        key_text = str(key)
+        lowered = key_text.lower()
+        if any(secret in lowered for secret in ("token", "secret", "key", "auth", "url")):
+            continue
+        if lowered in {"teacher_id", "user_id", "student_id", "session_id", "session_key"}:
+            safe[key_text] = "[scoped]"
+        else:
+            safe[key_text] = item
+    return safe
 
 
 def _json_from_text(text: str) -> Optional[Dict[str, Any]]:
@@ -429,6 +534,7 @@ async def student_agent_chat(
     x_hermes_session_key: Optional[str] = Header(default=None, alias="X-Hermes-Session-Key"),
     x_hermes_session_id: Optional[str] = Header(default=None, alias="X-Hermes-Session-Id"),
 ) -> StudentAgentChatResponse:
+    request_started = time.perf_counter()
     _verify_internal_auth(authorization)
     if not os.getenv("OPENROUTER_API_KEY"):
         raise HTTPException(status_code=503, detail="OPENROUTER_API_KEY is not configured")
@@ -440,6 +546,15 @@ async def student_agent_chat(
     session_key = _validate_header_scope(
         x_hermes_session_key or _fallback_student_session_key(request),
         "X-Hermes-Session-Key",
+    )
+    student_id = str(request.student.student_id or "").strip()
+    if not student_id:
+        raise HTTPException(status_code=400, detail="student_id is required")
+    _verify_student_scope_token(
+        request.gradeos_scope_token,
+        student_id=student_id,
+        session_id=session_id,
+        scope=request.scope,
     )
 
     attachment_context = [_compact_attachment(item) for item in request.attachments]
@@ -470,11 +585,9 @@ async def student_agent_chat(
         "model, usage, parse_status. Do not return teacher-facing artifacts, action "
         "proposals, internal URLs, raw tokens, or hidden reasoning.\n\n"
         "<gradeos-student-context>\n"
-        f"student_id: {request.student.student_id}\n"
-        f"session_id: {session_id}\n"
-        f"session_key: {session_key}\n"
-        f"scope: {request.scope}\n"
-        f"context: {request.context}\n"
+        "authenticated_student: true\n"
+        f"scope: {_prompt_safe_dict(request.scope)}\n"
+        f"context: {_prompt_safe_dict(request.context)}\n"
         f"history: {request.history[-8:]}\n"
         f"attachments: {attachment_context}\n"
         f"tool_policy: {request.tool_policy}\n"
@@ -485,8 +598,12 @@ async def student_agent_chat(
         "</gradeos-student-context>\n\n"
         f"Student question:\n{request.message}"
     )
+    build_started = time.perf_counter()
     agent = _build_student_agent(session_id, session_key)
+    agent_build_ms = (time.perf_counter() - build_started) * 1000
+    run_started = time.perf_counter()
     result = await asyncio.to_thread(agent.run_conversation, enriched_message)
+    run_conversation_ms = (time.perf_counter() - run_started) * 1000
     content = ""
     usage: Dict[str, Any] = {}
     if isinstance(result, dict):
@@ -503,6 +620,12 @@ async def student_agent_chat(
         usage = _agent_usage(agent, result, model_name)
     parsed = _json_from_text(content) or {}
     mastery = parsed.get("mastery") if isinstance(parsed.get("mastery"), dict) else {}
+    response_usage = dict(_usage_field(parsed, usage))
+    response_usage["hermes_timings_ms"] = {
+        "agent_build_ms": round(agent_build_ms, 2),
+        "run_conversation_ms": round(run_conversation_ms, 2),
+        "total_ms": round((time.perf_counter() - request_started) * 1000, 2),
+    }
 
     return StudentAgentChatResponse(
         request_id=request.request_id,
@@ -523,5 +646,5 @@ async def student_agent_chat(
             str(parsed.get("parse_error_code")) if parsed.get("parse_error_code") else None
         ),
         safety_level=str(parsed.get("safety_level")) if parsed.get("safety_level") else None,
-        usage=_usage_field(parsed, usage),
+        usage=response_usage,
     )
